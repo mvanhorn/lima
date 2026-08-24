@@ -1111,6 +1111,14 @@ func FindVirtiofsd(ctx context.Context, qemuExe string) (string, error) {
 }
 
 func VirtiofsdCmdline(cfg Config, mountIndex int) ([]string, error) {
+	hostGID := ""
+	if runtime.GOOS == "linux" {
+		hostGID = osutil.LimaUser(context.Background(), limayaml.ExistingLimaVersion(cfg.InstanceDir), false, cfg.LimaYAML.OS).Gid
+	}
+	return virtiofsdCmdline(cfg, mountIndex, runtime.GOOS, hostGID)
+}
+
+func virtiofsdCmdline(cfg Config, mountIndex int, hostOS, hostGID string) ([]string, error) {
 	mount := cfg.LimaYAML.Mounts[mountIndex]
 
 	vhostSock := filepath.Join(cfg.InstanceDir, fmt.Sprintf(filenames.VhostSock, mountIndex))
@@ -1119,9 +1127,30 @@ func VirtiofsdCmdline(cfg Config, mountIndex int) ([]string, error) {
 		logrus.Warnf("Failed to remove old vhost socket: %v", err)
 	}
 
-	return []string{
+	args := []string{
 		"--socket-path", vhostSock,
 		"--shared-dir", mount.Location,
+	}
+	if hostOS != "linux" {
+		return args, nil
+	}
+	translationArgs, err := virtiofsdGIDTranslationArgs(*cfg.LimaYAML.User.UID, hostGID)
+	if err != nil {
+		return nil, err
+	}
+	return append(args, translationArgs...), nil
+}
+
+func virtiofsdGIDTranslationArgs(guestGID uint32, hostGID string) ([]string, error) {
+	parsedHostGID, err := strconv.ParseUint(hostGID, 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid host GID %q: %w", hostGID, err)
+	}
+	if uint64(guestGID) == parsedHostGID {
+		return nil, nil
+	}
+	return []string{
+		"--translate-gid", fmt.Sprintf("map:%d:%d:1", guestGID, parsedHostGID),
 	}, nil
 }
 

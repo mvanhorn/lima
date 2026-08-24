@@ -151,3 +151,92 @@ func TestSwtpmCmdline(t *testing.T) {
 	_, err = os.Stat(swtpmSock)
 	assert.ErrorIs(t, err, os.ErrNotExist)
 }
+
+func TestVirtiofsdCmdline(t *testing.T) {
+	testCases := []struct {
+		name         string
+		hostOS       string
+		guestGID     uint32
+		hostGID      string
+		expectedTail []string
+	}{
+		{
+			name:         "Linux with different GIDs",
+			hostOS:       "linux",
+			guestGID:     1000,
+			hostGID:      "100",
+			expectedTail: []string{"--translate-gid", "map:1000:100:1"},
+		},
+		{
+			name:     "Linux with equal GIDs",
+			hostOS:   "linux",
+			guestGID: 1000,
+			hostGID:  "1000",
+		},
+		{
+			name:     "macOS",
+			hostOS:   "darwin",
+			guestGID: 1000,
+			hostGID:  "100",
+		},
+		{
+			name:     "Windows",
+			hostOS:   "windows",
+			guestGID: 1000,
+			hostGID:  "100",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			instanceDir := t.TempDir()
+			sharedDir := filepath.Join(instanceDir, "shared")
+			user := limatype.User{}
+			if tc.hostOS == "linux" {
+				user.UID = &tc.guestGID
+			}
+			cfg := Config{
+				InstanceDir: instanceDir,
+				LimaYAML: &limatype.LimaYAML{
+					User:   user,
+					Mounts: []limatype.Mount{{Location: sharedDir}},
+				},
+			}
+			vhostSock := filepath.Join(instanceDir, "virtiofsd-0.sock")
+			err := os.WriteFile(vhostSock, []byte("stale socket"), 0o644)
+			assert.NilError(t, err)
+
+			args, err := virtiofsdCmdline(cfg, 0, tc.hostOS, tc.hostGID)
+			assert.NilError(t, err)
+			expected := []string{
+				"--socket-path", vhostSock,
+				"--shared-dir", sharedDir,
+			}
+			expected = append(expected, tc.expectedTail...)
+			assert.DeepEqual(t, args, expected)
+
+			_, err = os.Stat(vhostSock)
+			assert.ErrorIs(t, err, os.ErrNotExist)
+		})
+	}
+}
+
+func TestVirtiofsdCmdlineInvalidHostGID(t *testing.T) {
+	testCases := []string{"invalid", "4294967296"}
+	for _, hostGID := range testCases {
+		t.Run(hostGID, func(t *testing.T) {
+			guestGID := uint32(1000)
+			cfg := Config{
+				InstanceDir: t.TempDir(),
+				LimaYAML: &limatype.LimaYAML{
+					User:   limatype.User{UID: &guestGID},
+					Mounts: []limatype.Mount{{Location: "/tmp/shared"}},
+				},
+			}
+
+			args, err := virtiofsdCmdline(cfg, 0, "linux", hostGID)
+			assert.ErrorContains(t, err, "invalid host GID")
+			assert.Assert(t, args == nil)
+		})
+	}
+}
