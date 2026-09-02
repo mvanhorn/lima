@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"testing"
 
+	"github.com/coreos/go-semver/semver"
 	"gotest.tools/v3/assert"
 
 	"github.com/lima-vm/lima/v2/pkg/limatype"
@@ -93,6 +94,135 @@ func TestParseQemuVersion(t *testing.T) {
 			assert.ErrorContains(t, err, tc.expectedError)
 		}
 		assert.Equal(t, tc.expectedValue, v.String())
+	}
+}
+
+func TestParseVirtiofsdVersion(t *testing.T) {
+	testCases := []struct {
+		name          string
+		versionOutput string
+		expectedValue string
+		expectedError string
+	}{
+		{
+			name:          "release",
+			versionOutput: "virtiofsd 1.13.0\n",
+			expectedValue: "1.13.0",
+		},
+		{
+			name:          "unrecognized output",
+			versionOutput: "virtiofsd development build\n",
+			expectedError: "failed to parse virtiofsd version",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			version, err := parseVirtiofsdVersion(tc.versionOutput)
+			if tc.expectedError == "" {
+				assert.NilError(t, err)
+				assert.Equal(t, version.String(), tc.expectedValue)
+			} else {
+				assert.ErrorContains(t, err, tc.expectedError)
+			}
+		})
+	}
+}
+
+func TestVirtiofsdCmdline(t *testing.T) {
+	guestGID := uint32(1000)
+	writable := true
+	readOnly := false
+	instanceDir := t.TempDir()
+	cfg := Config{
+		InstanceDir: instanceDir,
+		LimaYAML: &limatype.LimaYAML{
+			User: limatype.User{UID: &guestGID},
+			Mounts: []limatype.Mount{
+				{Location: "/first", Writable: &writable},
+				{Location: "/second", Writable: &writable},
+				{Location: "/read-only", Writable: &readOnly},
+			},
+		},
+	}
+	translationVersion := semver.New("1.13.0")
+	oldVersion := semver.New("1.12.0")
+
+	testCases := []struct {
+		name             string
+		mountIndex       int
+		hostGID          uint32
+		virtiofsdVersion *semver.Version
+		expectedArgs     []string
+		expectedError    string
+	}{
+		{
+			name:             "mismatched GID first mount",
+			mountIndex:       0,
+			hostGID:          100,
+			virtiofsdVersion: translationVersion,
+			expectedArgs: []string{
+				"--socket-path", filepath.Join(instanceDir, "virtiofsd-0.sock"),
+				"--shared-dir", "/first",
+				"--translate-gid", "map:1000:100:1",
+			},
+		},
+		{
+			name:             "mismatched GID second mount",
+			mountIndex:       1,
+			hostGID:          100,
+			virtiofsdVersion: translationVersion,
+			expectedArgs: []string{
+				"--socket-path", filepath.Join(instanceDir, "virtiofsd-1.sock"),
+				"--shared-dir", "/second",
+				"--translate-gid", "map:1000:100:1",
+			},
+		},
+		{
+			name:             "matching GID",
+			mountIndex:       0,
+			hostGID:          1000,
+			virtiofsdVersion: oldVersion,
+			expectedArgs: []string{
+				"--socket-path", filepath.Join(instanceDir, "virtiofsd-0.sock"),
+				"--shared-dir", "/first",
+			},
+		},
+		{
+			name:             "old virtiofsd",
+			mountIndex:       0,
+			hostGID:          100,
+			virtiofsdVersion: oldVersion,
+			expectedError:    "upgrade virtiofsd to 1.13.0 or later",
+		},
+		{
+			name:          "unknown virtiofsd version",
+			mountIndex:    0,
+			hostGID:       100,
+			expectedError: "could not verify support for GID translation",
+		},
+		{
+			name:             "read-only mount",
+			mountIndex:       2,
+			hostGID:          100,
+			virtiofsdVersion: oldVersion,
+			expectedArgs: []string{
+				"--socket-path", filepath.Join(instanceDir, "virtiofsd-2.sock"),
+				"--shared-dir", "/read-only",
+			},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := VirtiofsdCmdline(cfg, tc.mountIndex, tc.hostGID, tc.virtiofsdVersion)
+			if tc.expectedError == "" {
+				assert.NilError(t, err)
+				assert.DeepEqual(t, args, tc.expectedArgs)
+			} else {
+				assert.ErrorContains(t, err, tc.expectedError)
+			}
+		})
 	}
 }
 

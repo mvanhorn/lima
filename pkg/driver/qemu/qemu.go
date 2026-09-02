@@ -1036,7 +1036,7 @@ func Cmdline(ctx context.Context, cfg Config) (exe string, args []string, err er
 	return exe, args, nil
 }
 
-func FindVirtiofsd(ctx context.Context, qemuExe string) (string, error) {
+func FindVirtiofsd(ctx context.Context, qemuExe string) (string, *semver.Version, error) {
 	type vhostUserBackend struct {
 		BackendType string `json:"type"`
 		Binary      string `json:"binary"`
@@ -1044,7 +1044,7 @@ func FindVirtiofsd(ctx context.Context, qemuExe string) (string, error) {
 
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 
 	const relativePath = "share/qemu/vhost-user"
@@ -1103,14 +1103,18 @@ func FindVirtiofsd(ctx context.Context, qemuExe string) (string, error) {
 				continue
 			}
 
-			return vhostCfg.Binary, nil
+			version, err := parseVirtiofsdVersion(string(output))
+			if err != nil {
+				logrus.Warnf("Failed to detect %s version: %v", vhostCfg.Binary, err)
+			}
+			return vhostCfg.Binary, version, nil
 		}
 	}
 
-	return "", errors.New("failed to locate virtiofsd")
+	return "", nil, errors.New("failed to locate virtiofsd")
 }
 
-func VirtiofsdCmdline(cfg Config, mountIndex int) ([]string, error) {
+func VirtiofsdCmdline(cfg Config, mountIndex int, hostGID uint32, virtiofsdVersion *semver.Version) ([]string, error) {
 	mount := cfg.LimaYAML.Mounts[mountIndex]
 
 	vhostSock := filepath.Join(cfg.InstanceDir, fmt.Sprintf(filenames.VhostSock, mountIndex))
@@ -1119,10 +1123,27 @@ func VirtiofsdCmdline(cfg Config, mountIndex int) ([]string, error) {
 		logrus.Warnf("Failed to remove old vhost socket: %v", err)
 	}
 
-	return []string{
+	args := []string{
 		"--socket-path", vhostSock,
 		"--shared-dir", mount.Location,
-	}, nil
+	}
+
+	if mount.Writable != nil && *mount.Writable {
+		guestGID := *cfg.LimaYAML.User.UID
+		if guestGID != hostGID {
+			if virtiofsdVersion == nil {
+				return nil, errors.New("could not verify support for GID translation; upgrade virtiofsd to 1.13.0 or later or configure a different virtiofsd binary")
+			}
+			minimumVersion := semver.New("1.13.0")
+			if virtiofsdVersion.LessThan(*minimumVersion) {
+				return nil, fmt.Errorf("virtiofsd %s does not support the GID translation required to map guest GID %d to host GID %d; upgrade virtiofsd to 1.13.0 or later or configure a different virtiofsd binary",
+					virtiofsdVersion, guestGID, hostGID)
+			}
+			args = append(args, "--translate-gid", fmt.Sprintf("map:%d:%d:1", guestGID, hostGID))
+		}
+	}
+
+	return args, nil
 }
 
 // qemuArch returns the arch string used by qemu.
@@ -1243,6 +1264,16 @@ func parseQemuVersion(output string) (*semver.Version, error) {
 		return semver.New(matches[1]), nil
 	}
 	return &semver.Version{}, fmt.Errorf("failed to parse %v", output)
+}
+
+func parseVirtiofsdVersion(output string) (*semver.Version, error) {
+	lines := strings.Split(output, "\n")
+	regex := regexp.MustCompile(`^virtiofsd v?(\d+\.\d+\.\d+)`)
+	matches := regex.FindStringSubmatch(lines[0])
+	if len(matches) == 2 {
+		return semver.New(matches[1]), nil
+	}
+	return nil, fmt.Errorf("failed to parse virtiofsd version from %q", output)
 }
 
 func getQemuVersion(ctx context.Context, qemuExe string) (*semver.Version, error) {

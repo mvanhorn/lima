@@ -14,6 +14,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -305,13 +306,24 @@ func (l *LimaQemuDriver) Start(ctx context.Context) (chan error, error) {
 
 	var vhostCmds []*exec.Cmd
 	if *l.Instance.Config.MountType == limatype.VIRTIOFS {
-		vhostExe, err := FindVirtiofsd(ctx, qExe)
+		hostGID := *l.Instance.Config.User.UID
+		for _, mount := range l.Instance.Config.Mounts {
+			if mount.Writable != nil && *mount.Writable {
+				hostGID, err = currentPrimaryGID()
+				if err != nil {
+					return nil, fmt.Errorf("failed to resolve host primary GID for virtiofs: %w", err)
+				}
+				break
+			}
+		}
+
+		vhostExe, virtiofsdVersion, err := FindVirtiofsd(ctx, qExe)
 		if err != nil {
 			return nil, err
 		}
 
 		for i := range l.Instance.Config.Mounts {
-			args, err := VirtiofsdCmdline(qCfg, i)
+			args, err := VirtiofsdCmdline(qCfg, i, hostGID, virtiofsdVersion)
 			if err != nil {
 				return nil, err
 			}
@@ -440,6 +452,18 @@ func (l *LimaQemuDriver) Start(ctx context.Context) (chan error, error) {
 	}
 
 	return l.qWaitCh, nil
+}
+
+func currentPrimaryGID() (uint32, error) {
+	currentUser, err := user.Current()
+	if err != nil {
+		return 0, fmt.Errorf("failed to look up current user: %w", err)
+	}
+	gid, err := strconv.ParseUint(currentUser.Gid, 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid primary GID %q for current user %q: %w", currentUser.Gid, currentUser.Username, err)
+	}
+	return uint32(gid), nil
 }
 
 func (l *LimaQemuDriver) Stop(ctx context.Context) error {
